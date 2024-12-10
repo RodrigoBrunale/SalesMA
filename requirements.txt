@@ -1,7 +1,3 @@
-google-cloud-bigquery
-google-auth
-google-auth-oauthlib
-google-auth-httplib2
-pandas
-numpy
-PyYAML
+google-cloud-bigquery>=2.0.0
+pandas>=1.0.0
+numpy>=1.20.0
