@@ -1,129 +1,115 @@
-# Import necessary libraries
-from google.cloud import bigquery
-from google.oauth2 import service_account
-import pandas as pd
 import os
-import numpy as np
-import yaml
 import logging
+from google.cloud import bigquery
+import pandas as pd
+import numpy as np
 
-# Configure logging
-logger = logging.getLogger()
+logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-# Create handlers
-stream_handler = logging.StreamHandler()
-file_handler = logging.FileHandler('activity.log')
+def run_sales_ma(event, context):
+    logger.info('Cloud Function started')
 
-# Set logging level for handlers
-stream_handler.setLevel(logging.INFO)
-file_handler.setLevel(logging.INFO)
+    # Load and validate environment variables
+    required_vars = [
+        'BIGQUERY_SOURCE_TABLE',
+        'BIGQUERY_DESTINATION_TABLE_DAY',
+        'BIGQUERY_DESTINATION_TABLE_WEEK',
+        'BIGQUERY_DESTINATION_TABLE_MONTH',
+        'DATE_COLUMN',
+        'SALES_COLUMN'
+    ]
+    for var in required_vars:
+        if not os.getenv(var):
+            raise ValueError(f"Environment variable {var} must be set.")
 
-# Create formatter
-formatter = logging.Formatter('%(asctime)s %(message)s')
+    source_table = os.getenv('BIGQUERY_SOURCE_TABLE')
+    day_table = os.getenv('BIGQUERY_DESTINATION_TABLE_DAY')
+    week_table = os.getenv('BIGQUERY_DESTINATION_TABLE_WEEK')
+    month_table = os.getenv('BIGQUERY_DESTINATION_TABLE_MONTH')
+    date_column = os.getenv('DATE_COLUMN')
+    sales_column = os.getenv('SALES_COLUMN')
 
-# Add formatter to handlers
-stream_handler.setFormatter(formatter)
-file_handler.setFormatter(formatter)
+    # Default windows if not provided
+    windows_day = [int(x) for x in os.getenv('WINDOWS_DAY', '7,21,30,50,100,200').split(',')]
+    windows_week = [int(x) for x in os.getenv('WINDOWS_WEEK', '4,13,26,52,78,104').split(',')]
+    windows_month = [int(x) for x in os.getenv('WINDOWS_MONTH', '1,3,6,12,18,24,36').split(',')]
 
-# Add handlers to logger
-logger.addHandler(stream_handler)
-logger.addHandler(file_handler)
+    client = bigquery.Client()
 
-logger.info('Script started')
+    # Fetch source data
+    sql_query = f"""
+        SELECT
+            {date_column},
+            pedido_number,
+            {sales_column}
+        FROM `{source_table}`
+    """
+    logger.info('Executing query: %s', sql_query)
+    data = client.query(sql_query).to_dataframe()
 
-try:
-    # Load the configuration file
-    try:
-        with open('config.yaml', 'r') as f:
-            config = yaml.safe_load(f)
-    except FileNotFoundError:
-        # If the configuration file does not exist, create a template and exit
-        config_template = {
-            'google_application_credentials': 'path/to/your/service/account/key.json',
-            'bigquery_source_table': 'project.dataset.table',
-            'date_column': 'date',
-            'sales_column': 'sales',
-            'bigquery_destination_table_day': 'project.dataset.table_day',
-            'bigquery_destination_table_week': 'project.dataset.table_week',
-            'bigquery_destination_table_month': 'project.dataset.table_month',
-            'windows_day': [7, 21, 30, 50, 100, 200],
-            'windows_week': [1, 2, 3, 4, 5, 10, 20],
-            'windows_month': [1, 2, 3, 6, 12, 24]
-        }
-        with open('config.yaml', 'w') as f:
-            yaml.safe_dump(config_template, f)
-        logger.info('Configuration file not found. A template has been created. Please fill out the config.yaml file and run the script again.')
-        exit()
+    # Convert and validate date column
+    data[date_column] = pd.to_datetime(data[date_column], errors='coerce')
+    if data[date_column].isnull().any():
+        raise ValueError("Some rows have invalid date values. Please check the source data.")
+    
+    # Filter out non-positive sales
+    initial_count = len(data)
+    data = data[data[sales_column] > 0]
+    logger.info('Filtered out non-positive sales. Removed %d rows.', initial_count - len(data))
 
-    logger.info('Configuration file loaded')
+    # Deduplicate based on (date, pedido_number)
+    before_dedup = len(data)
+    data = data.drop_duplicates(subset=[date_column, 'pedido_number'], keep='first')
+    logger.info('Removed %d duplicate rows.', before_dedup - len(data))
 
-    # Establish a connection to BigQuery
-    credentials = service_account.Credentials.from_service_account_file(config['google_application_credentials'])
-    client = bigquery.Client(credentials=credentials)
+    # Aggregate daily data
+    daily_data = data.groupby(data[date_column].dt.date)[sales_column].sum().reset_index()
+    daily_data.rename(columns={date_column: 'date'}, inplace=True)
 
-    logger.info('Connected to BigQuery')
+    # Fill missing days with zero sales
+    full_date_range = pd.date_range(start=daily_data['date'].min(), end=daily_data['date'].max(), freq='D')
+    daily_data = daily_data.set_index('date').reindex(full_date_range, fill_value=0).reset_index()
+    daily_data.columns = ['date', sales_column]
+    logger.info('Missing days filled with zero. Total daily rows: %d', len(daily_data))
 
-    # Build the SQL query to get the sales data
-    source_table = config['bigquery_source_table']
-    date_column = config['date_column']
-    sales_column = config['sales_column']
-    sql_query = f"SELECT {date_column}, {sales_column} FROM `{source_table}`"
+    # Create weekly and monthly aggregates from daily data
+    daily_data['date'] = pd.to_datetime(daily_data['date'])
 
-    logger.info('SQL query defined')
+    weekly_data = daily_data.set_index('date').resample('W')[sales_column].sum().reset_index()
+    monthly_data = daily_data.set_index('date').resample('M')[sales_column].sum().reset_index()
 
-    # Execute the SQL query and store the result in a DataFrame
-    query_job = client.query(sql_query)
-    data = query_job.to_dataframe()
-
-    logger.info('Data loaded from BigQuery')
-
-    # Ensure the sales date column is in datetime format for time-based calculations
-    data[date_column] = pd.to_datetime(data[date_column])
-
-    # Sort data by date to ensure calculations are accurate
-    data.sort_values(date_column, inplace=True)
-
-    # Group sales data by day, week, and month. This is to prepare the data for moving average calculations.
-    data_daily = data.groupby(data[date_column].dt.date)[sales_column].sum().reset_index()
-    data_weekly = data.groupby(pd.Grouper(key=date_column, freq='W'))[sales_column].sum().reset_index()
-    data_monthly = data.groupby(pd.Grouper(key=date_column, freq='M'))[sales_column].sum().reset_index()
-
-    # Retrieve moving average window sizes from configuration file
-    windows_daily = config['windows_day']
-    windows_weekly = config['windows_week']
-    windows_monthly = config['windows_month']
-
-    # Calculate simple, weighted, and exponential moving averages for each window size and time period
-    for data, windows, freq in zip([data_daily, data_weekly, data_monthly], [windows_daily, windows_weekly, windows_monthly], ['day', 'week', 'month']):
+    # Compute MAs
+    def compute_mas(df, freq, windows):
         for window in windows:
-            data[f'MA_{window}{freq}'] = data[sales_column].rolling(window).mean()
+            df[f'MA_{window}{freq}'] = df[sales_column].rolling(window).mean()
             weights = np.arange(1, window + 1)
-            data[f'WMA_{window}{freq}'] = data[sales_column].rolling(window).apply(lambda prices: np.dot(prices, weights) / weights.sum(), raw=True)
-            data[f'EMA_{window}{freq}'] = data[sales_column].ewm(span=window, adjust=False).mean()
+            df[f'WMA_{window}{freq}'] = df[sales_column].rolling(window).apply(
+                lambda prices: np.dot(prices, weights) / weights.sum(), raw=True
+            )
+            df[f'EMA_{window}{freq}'] = df[sales_column].ewm(span=window, adjust=False).mean()
+        return df
 
-        data.rename(columns={date_column: 'date'}, inplace=True)
+    daily_data = compute_mas(daily_data, 'day', windows_day)
+    weekly_data = compute_mas(weekly_data, 'week', windows_week)
+    monthly_data = compute_mas(monthly_data, 'month', windows_month)
 
-        # Define destination table in BigQuery based on time period (day, week, month)
-        destination_table = config[f'bigquery_destination_table_{freq}']
-
-        # Define table schema for BigQuery to correctly interpret the data types
+    def upload_to_bq(df, destination_table):
+        if not destination_table:
+            raise ValueError("Destination table not set. Please set the appropriate environment variable.")
         schema = [
             bigquery.SchemaField("date", "DATE"),
-            bigquery.SchemaField(sales_column, "FLOAT64"),
-        ] + [bigquery.SchemaField(column, "FLOAT64") for column in data.columns if column not in ["date", sales_column]]
+            bigquery.SchemaField(sales_column, "FLOAT64")
+        ] + [bigquery.SchemaField(col, "FLOAT64") for col in df.columns if col not in ["date", sales_column]]
 
-        # Configure the load job to upload DataFrame to BigQuery with specified schema and partitioning by date
         job_config = bigquery.LoadJobConfig(schema=schema, time_partitioning=bigquery.TimePartitioning(field="date"))
+        job = client.load_table_from_dataframe(df, destination_table, job_config=job_config)
+        job.result()
+        logger.info('Data uploaded to %s', destination_table)
 
-        # Upload the DataFrame to BigQuery
-        job = client.load_table_from_dataframe(data, destination_table, job_config=job_config)
-        job.result()  # Wait for the job to complete
+    # Upload
+    upload_to_bq(daily_data, day_table)
+    upload_to_bq(weekly_data, week_table)
+    upload_to_bq(monthly_data, month_table)
 
-        logger.info(f'Data uploaded to {destination_table} in BigQuery')
-
-    logger.info('Script completed successfully')
-
-# If an error occurs, log the error message and traceback
-except Exception as e:
-    logger.error('An error occurred:', exc_info=True)
+    logger.info('Cloud Function completed successfully')
