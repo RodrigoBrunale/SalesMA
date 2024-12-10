@@ -7,7 +7,7 @@ import numpy as np
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-def run_sales_ma(event, context):
+def run_sales_ma(event):
     logger.info('Cloud Function started')
 
     # Load and validate environment variables
@@ -113,3 +113,4 @@ def run_sales_ma(event, context):
     upload_to_bq(monthly_data, month_table)
 
     logger.info('Cloud Function completed successfully')
+    return ("MAs computed and uploaded successfully", 200)
